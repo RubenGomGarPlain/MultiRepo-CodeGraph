@@ -1,0 +1,201 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# APPROACH B — Cached: clone → index → cache ~/.codegraph/graph.db → run-tool
+#
+# ✅ Solo re-indexa repos que cambiaron (cache key = SHA de cada repo)
+# ⏱  Primer run: igual que A. Siguientes: ~10-30s (solo restaura cache)
+# 💡 Ideal para: repos medianos/grandes, ejecuciones frecuentes, sin infra Azure
+# ─────────────────────────────────────────────────────────────────────────────
+name: "CodeGraph [B] Cached — Impact Analysis"
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Symbol to analyze (e.g. AuthService, verifyToken)"
+        required: true
+        default: "AuthService"
+      force_reindex:
+        description: "Force full re-index (ignore cache)"
+        required: false
+        default: "false"
+        type: choice
+        options: ["false", "true"]
+
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  impact-analysis:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Install CodeGraph ───────────────────────────────────────────────
+      - name: Install CodeGraph MCP
+        run: |
+          npm install -g @astudioplus/codegraph-mcp
+          echo "BIN=$(npm root -g)/@astudioplus/codegraph-mcp/bin/codegraph-server-linux-x64" >> "$GITHUB_ENV"
+
+      # ── 2. Clone all org repos ─────────────────────────────────────────────
+      - name: Clone org repos
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ORG: ${{ vars.CODEGRAPH_ORG || 'my-org' }}
+        run: |
+          mkdir -p repos
+          REPOS="${CODEGRAPH_REPOS:-repo-auth repo-payments repo-gateway repo-notifications}"
+          for REPO in $REPOS; do
+            git clone --depth 1 \
+              "https://x-access-token:${GH_PAT}@github.com/${ORG}/${REPO}.git" \
+              "repos/${REPO}"
+          done
+
+      # ── 3. Compute cache key from repo HEADs ──────────────────────────────
+      # Cache key = SHA1 of all HEAD commits concatenated.
+      # If any repo changes → cache miss → full re-index.
+      # If all repos are unchanged → cache hit → skip indexing entirely.
+      - name: Compute cache key
+        id: cache-key
+        run: |
+          SHAS=""
+          for DIR in repos/*/; do
+            SHA=$(git -C "$DIR" rev-parse HEAD)
+            SHAS="${SHAS}${SHA}"
+          done
+          # Hash of all SHAs combined
+          KEY=$(echo -n "$SHAS" | sha256sum | cut -d' ' -f1)
+          echo "key=codegraph-graph-${KEY}" >> "$GITHUB_OUTPUT"
+          echo "Cache key: codegraph-graph-${KEY}"
+
+      # ── 4. Restore cache ───────────────────────────────────────────────────
+      - name: Restore CodeGraph graph cache
+        id: restore-cache
+        if: github.event.inputs.force_reindex != 'true'
+        uses: actions/cache/restore@v4
+        with:
+          path: ~/.codegraph
+          key: ${{ steps.cache-key.outputs.key }}
+          # Fallback: use any previous graph (partial cache — still faster than 0)
+          restore-keys: |
+            codegraph-graph-
+
+      # ── 5. Index (only if cache miss) ─────────────────────────────────────
+      - name: Index workspaces (cache miss)
+        if: steps.restore-cache.outputs.cache-hit != 'true' || github.event.inputs.force_reindex == 'true'
+        run: |
+          WORKSPACE_ARGS=""
+          for DIR in repos/*/; do
+            WORKSPACE_ARGS="$WORKSPACE_ARGS --workspace $DIR"
+          done
+
+          echo "📊 Cache miss — indexing all workspaces..."
+          "$BIN" \
+            --graph-only \
+            $WORKSPACE_ARGS \
+            --run-tool codegraph_get_module_summary \
+            --tool-args '{"scope":"."}' \
+            > /dev/null 2>&1 || true
+          echo "✅ Indexing complete. Graph saved to ~/.codegraph/graph.db"
+          du -sh ~/.codegraph/
+
+      - name: Skip indexing (cache hit)
+        if: steps.restore-cache.outputs.cache-hit == 'true' && github.event.inputs.force_reindex != 'true'
+        run: echo "⚡ Cache hit — skipping indexing. Using persisted graph.db"
+
+      # ── 6. Save cache (after indexing) ────────────────────────────────────
+      - name: Save CodeGraph graph cache
+        if: steps.restore-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ~/.codegraph
+          key: ${{ steps.cache-key.outputs.key }}
+
+      # ── 7. Run analysis tools ──────────────────────────────────────────────
+      - name: Run impact analysis
+        run: |
+          SYMBOL="${{ github.event.inputs.symbol || 'AuthService' }}"
+          WORKSPACE_ARGS=""
+          for DIR in repos/*/; do
+            WORKSPACE_ARGS="$WORKSPACE_ARGS --workspace $DIR"
+          done
+
+          echo "🔍 Analyzing: $SYMBOL"
+
+          "$BIN" --graph-only $WORKSPACE_ARGS \
+            --run-tool codegraph_analyze_impact \
+            --tool-args "{\"symbol\":\"${SYMBOL}\",\"depth\":3}" \
+            > impact.md 2> codegraph.err || true
+
+          "$BIN" --graph-only $WORKSPACE_ARGS \
+            --run-tool codegraph_get_callers \
+            --tool-args "{\"symbol\":\"${SYMBOL}\",\"depth\":3}" \
+            > callers.md 2>> codegraph.err || true
+
+          "$BIN" --graph-only $WORKSPACE_ARGS \
+            --run-tool codegraph_find_related_tests \
+            --tool-args "{\"symbol\":\"${SYMBOL}\"}" \
+            > tests.md 2>> codegraph.err || true
+
+      # ── 8. Show cache stats ────────────────────────────────────────────────
+      - name: Cache stats
+        run: |
+          echo "=== Cache info ==="
+          echo "Hit: ${{ steps.restore-cache.outputs.cache-hit }}"
+          echo "Key: ${{ steps.cache-key.outputs.key }}"
+          du -sh ~/.codegraph/ 2>/dev/null || echo "No graph.db found"
+
+      # ── 9. Post PR comment ─────────────────────────────────────────────────
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const symbol  = '${{ github.event.inputs.symbol || 'AuthService' }}';
+            const cacheHit = '${{ steps.restore-cache.outputs.cache-hit }}' === 'true';
+            const impact   = fs.existsSync('impact.md')  ? fs.readFileSync('impact.md',  'utf8') : '_not available_';
+            const callers  = fs.existsSync('callers.md') ? fs.readFileSync('callers.md', 'utf8') : '_not available_';
+            const tests    = fs.existsSync('tests.md')   ? fs.readFileSync('tests.md',   'utf8') : '_not available_';
+
+            const body = [
+              `## 🔍 CodeGraph Impact Analysis — \`${symbol}\``,
+              `> Strategy: **B — Cached** (graph.db persisted via actions/cache) ${cacheHit ? '⚡ cache hit' : '🔄 full re-index'}`,
+              ``,
+              `### 💥 Blast Radius`, impact, ``,
+              `### 📞 Callers (depth 3)`, callers, ``,
+              `### 🧪 Test Coverage`, tests, ``,
+              `<sub>Powered by [CodeGraph](https://github.com/codegraph-ai/codegraph) · Approach B</sub>`,
+            ].join('\n');
+
+            const marker = '## 🔍 CodeGraph Impact Analysis';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+      # ── 10. Upload artifacts ──────────────────────────────────────────────
+      - name: Upload analysis artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegraph-cached-${{ github.run_id }}
+          path: |
+            impact.md
+            callers.md
+            tests.md
+            codegraph.err

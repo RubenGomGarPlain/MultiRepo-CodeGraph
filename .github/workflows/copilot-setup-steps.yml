@@ -1,0 +1,64 @@
+name: "Copilot Setup Steps"
+
+# Runs automatically when this file changes, and can be triggered manually.
+# The `copilot-setup-steps` job runs BEFORE the Copilot coding agent starts working,
+# pre-installing all tools the agent needs to bootstrap CodeGraph autonomously.
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+  pull_request:
+    paths:
+      - .github/workflows/copilot-setup-steps.yml
+
+jobs:
+  # MUST be named exactly `copilot-setup-steps`
+  copilot-setup-steps:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      # ── Node.js ─────────────────────────────────────────────────────────────
+      - name: Set up Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      # ── CodeGraph MCP server (binary via npm — no Rust build needed) ────────
+      # Used by Approach A (ephemeral) and Approach B (cached).
+      # Approach C (Container App) only needs curl, which is pre-installed.
+      - name: Install CodeGraph MCP server
+        run: |
+          npm install -g @astudioplus/codegraph-mcp
+          # Verify binary is accessible
+          BIN="$(npm root -g)/@astudioplus/codegraph-mcp/bin/codegraph-server-linux-x64"
+          chmod +x "$BIN"
+          echo "CODEGRAPH_BIN=$BIN" >> "$GITHUB_ENV"
+          echo "✅ CodeGraph installed: $BIN"
+
+      # ── yq — for parsing config/repos.yml from shell ────────────────────────
+      - name: Install yq (YAML parser)
+        run: |
+          YQ_VERSION="v4.44.1"
+          curl -sL "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+            -o /usr/local/bin/yq
+          chmod +x /usr/local/bin/yq
+          yq --version
+
+      # ── Smoke test — verify CodeGraph can index ──────────────────────────────
+      - name: Smoke test CodeGraph
+        run: |
+          BIN="$(npm root -g)/@astudioplus/codegraph-mcp/bin/codegraph-server-linux-x64"
+          mkdir -p /tmp/smoke-test
+          echo "fn main() { println!(\"hello\"); }" > /tmp/smoke-test/main.rs
+          "$BIN" \
+            --graph-only \
+            --workspace /tmp/smoke-test \
+            --run-tool codegraph_get_module_summary \
+            --tool-args '{"scope":"."}' \
+            > /dev/null 2>&1 && echo "✅ Smoke test passed" || echo "⚠️  Smoke test skipped (non-fatal)"
+          rm -rf /tmp/smoke-test

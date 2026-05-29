@@ -1,0 +1,191 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# APPROACH C — Azure Container App + supergateway → HTTP :3000
+#
+# ✅ Servidor MCP siempre activo, grafo indexado en memoria/disco del container
+# ⏱  Latencia de análisis: <1s (grafo ya cargado). Deploy inicial: ~10 min.
+# 💡 Ideal para: orgs grandes, análisis frecuentes, Copilot Chat interactivo,
+#    múltiples devs consultando el mismo grafo
+#
+# Prerequisito: Container App desplegado con infra/container-app.bicep
+# Endpoint disponible en: https://<app>.<region>.azurecontainerapps.io
+# ─────────────────────────────────────────────────────────────────────────────
+name: "CodeGraph [C] Container App — Impact Analysis"
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Symbol to analyze"
+        required: true
+        default: "AuthService"
+      container_app_url:
+        description: "Container App base URL (overrides var CODEGRAPH_APP_URL)"
+        required: false
+
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  impact-analysis:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Resolve Container App URL ──────────────────────────────────────
+      - name: Resolve Container App URL
+        id: app-url
+        run: |
+          URL="${{ github.event.inputs.container_app_url || vars.CODEGRAPH_APP_URL }}"
+          if [ -z "$URL" ]; then
+            echo "::error::No Container App URL provided. Set CODEGRAPH_APP_URL repo variable or pass container_app_url input."
+            exit 1
+          fi
+          # Normalize — remove trailing slash
+          URL="${URL%/}"
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Container App: $URL"
+
+      # ── 2. Health check ────────────────────────────────────────────────────
+      - name: Health check
+        run: |
+          URL="${{ steps.app-url.outputs.url }}"
+          echo "Checking health at $URL/health ..."
+          for i in 1 2 3 4 5; do
+            STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$URL/health" || true)
+            if [ "$STATUS" = "200" ]; then
+              echo "✅ Container App is healthy"
+              break
+            fi
+            echo "Attempt $i: status=$STATUS — retrying in 10s..."
+            sleep 10
+          done
+          if [ "$STATUS" != "200" ]; then
+            echo "::error::Container App not reachable at $URL/health"
+            exit 1
+          fi
+
+      # ── 3. Run impact analysis via MCP-over-HTTP ───────────────────────────
+      # supergateway exposes the MCP server as SSE on /sse.
+      # We call the HTTP endpoint directly with JSON-RPC.
+      - name: Run impact analysis
+        id: analysis
+        run: |
+          SYMBOL="${{ github.event.inputs.symbol || 'AuthService' }}"
+          URL="${{ steps.app-url.outputs.url }}"
+
+          echo "🔍 Calling codegraph_analyze_impact for: $SYMBOL"
+
+          # MCP JSON-RPC call via supergateway HTTP endpoint
+          PAYLOAD=$(cat <<EOF
+          {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+              "name": "codegraph_analyze_impact",
+              "arguments": {
+                "symbol": "${SYMBOL}",
+                "depth": 3
+              }
+            }
+          }
+          EOF
+          )
+
+          curl -s -X POST "$URL/message" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" \
+            > impact_raw.json 2> curl.err
+
+          # Extract text content from MCP response
+          cat impact_raw.json | python3 -c "
+          import sys, json
+          data = json.load(sys.stdin)
+          result = data.get('result', {})
+          content = result.get('content', [{}])
+          text = content[0].get('text', str(result)) if content else str(result)
+          print(text)
+          " > impact.md 2>/dev/null || cat impact_raw.json > impact.md
+
+          echo "--- IMPACT RESULT ---"
+          cat impact.md
+
+      # ── 4. Run callers ─────────────────────────────────────────────────────
+      - name: Run callers
+        run: |
+          SYMBOL="${{ github.event.inputs.symbol || 'AuthService' }}"
+          URL="${{ steps.app-url.outputs.url }}"
+
+          curl -s -X POST "$URL/message" \
+            -H "Content-Type: application/json" \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"codegraph_get_callers\",\"arguments\":{\"symbol\":\"${SYMBOL}\",\"depth\":3}}}" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('content',[{}])[0].get('text',''))" \
+            > callers.md 2>/dev/null || echo "_not available_" > callers.md
+
+      # ── 5. Run related tests ───────────────────────────────────────────────
+      - name: Run related tests
+        run: |
+          SYMBOL="${{ github.event.inputs.symbol || 'AuthService' }}"
+          URL="${{ steps.app-url.outputs.url }}"
+
+          curl -s -X POST "$URL/message" \
+            -H "Content-Type: application/json" \
+            -d "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"codegraph_find_related_tests\",\"arguments\":{\"symbol\":\"${SYMBOL}\"}}}" \
+            | python3 -c "import sys,json; d=json.load(sys.stdin); print(d.get('result',{}).get('content',[{}])[0].get('text',''))" \
+            > tests.md 2>/dev/null || echo "_not available_" > tests.md
+
+      # ── 6. Post PR comment ─────────────────────────────────────────────────
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const symbol  = '${{ github.event.inputs.symbol || 'AuthService' }}';
+            const appUrl  = '${{ steps.app-url.outputs.url }}';
+            const impact  = fs.existsSync('impact.md')  ? fs.readFileSync('impact.md',  'utf8') : '_not available_';
+            const callers = fs.existsSync('callers.md') ? fs.readFileSync('callers.md', 'utf8') : '_not available_';
+            const tests   = fs.existsSync('tests.md')   ? fs.readFileSync('tests.md',   'utf8') : '_not available_';
+
+            const body = [
+              `## 🔍 CodeGraph Impact Analysis — \`${symbol}\``,
+              `> Strategy: **C — Azure Container App** (persistent MCP server via supergateway) · \`${appUrl}\``,
+              ``,
+              `### 💥 Blast Radius`, impact, ``,
+              `### 📞 Callers (depth 3)`, callers, ``,
+              `### 🧪 Test Coverage`, tests, ``,
+              `<sub>Powered by [CodeGraph](https://github.com/codegraph-ai/codegraph) · Approach C</sub>`,
+            ].join('\n');
+
+            const marker = '## 🔍 CodeGraph Impact Analysis';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner, repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+      # ── 7. Upload artifacts ────────────────────────────────────────────────
+      - name: Upload analysis artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegraph-container-${{ github.run_id }}
+          path: |
+            impact.md
+            callers.md
+            tests.md
+            impact_raw.json

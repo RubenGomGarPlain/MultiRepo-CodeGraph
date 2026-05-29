@@ -1,0 +1,26 @@
+# CodeGraph org-level config
+# One file per client — change this and the GH_PAT secret to onboard a new org.
+
+org: RubenGomGarPlain                        # GitHub org or Azure DevOps org name
+provider: github                   # github | azuredevops
+
+# Personal Access Token secret name (set in the repo's GitHub Actions secrets)
+pat_secret: GH_PAT
+
+# Repos to index (relative to org — full URL = https://github.com/<org>/<repo>)
+repos:
+  - advisor-management
+  - skills
+
+# Symbol to analyze by default when running approach A or B manually
+default_symbol: AuthService
+
+# CodeGraph settings
+codegraph:
+  profile: graph          # all | core | graph | memory
+  embedding: false        # false = --graph-only (faster, no ONNX model)
+  max_files: 10000
+  exclude:
+    - "**/node_modules/**"
+    - "**/dist/**"
+    - "**/target/**"

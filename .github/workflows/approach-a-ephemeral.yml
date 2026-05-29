@@ -1,0 +1,178 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# APPROACH A — Ephemeral: clone → index → run-tool → delete
+#
+# ✅ Sin infraestructura, sin estado
+# ⏱  Indexa desde cero en cada ejecución (~1-3 min dependiendo del tamaño)
+# 💡 Ideal para: primer POC, repos pequeños, no necesitas persistencia
+# ─────────────────────────────────────────────────────────────────────────────
+name: "CodeGraph [A] Ephemeral — Impact Analysis"
+
+on:
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Symbol to analyze (e.g. AuthService, verifyToken)"
+        required: true
+        default: "AuthService"
+      output_format:
+        description: "Output format"
+        required: false
+        default: "markdown"
+        type: choice
+        options: [markdown, json]
+
+  # Optional: trigger automatically on PR
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  impact-analysis:
+    runs-on: ubuntu-latest
+
+    steps:
+      # ── 1. Install CodeGraph (npm — no Rust build needed) ─────────────────
+      - name: Install CodeGraph MCP
+        run: |
+          npm install -g @astudioplus/codegraph-mcp
+          echo "BIN=$(npm root -g)/@astudioplus/codegraph-mcp/bin/codegraph-server-linux-x64" >> "$GITHUB_ENV"
+          echo "✅ CodeGraph installed"
+
+      # ── 2. Clone all org repos (shallow — just the tip) ───────────────────
+      - name: Clone org repos
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+          ORG: ${{ vars.CODEGRAPH_ORG || 'my-org' }}
+        run: |
+          mkdir -p repos
+          # Read repo list from config — or override via env var CODEGRAPH_REPOS
+          REPOS="${CODEGRAPH_REPOS:-repo-auth repo-payments repo-gateway repo-notifications}"
+          for REPO in $REPOS; do
+            echo "Cloning $ORG/$REPO ..."
+            git clone --depth 1 \
+              "https://x-access-token:${GH_PAT}@github.com/${ORG}/${REPO}.git" \
+              "repos/${REPO}"
+          done
+          echo "✅ All repos cloned"
+          du -sh repos/
+
+      # ── 3. Build workspace flags ───────────────────────────────────────────
+      - name: Build codegraph workspace args
+        run: |
+          WORKSPACE_ARGS=""
+          for DIR in repos/*/; do
+            WORKSPACE_ARGS="$WORKSPACE_ARGS --workspace $DIR"
+          done
+          echo "WORKSPACE_ARGS=$WORKSPACE_ARGS" >> "$GITHUB_ENV"
+          echo "Workspaces: $WORKSPACE_ARGS"
+
+      # ── 4. Index + analyze impact ──────────────────────────────────────────
+      - name: Run impact analysis
+        run: |
+          SYMBOL="${{ github.event.inputs.symbol || 'AuthService' }}"
+          FORMAT="${{ github.event.inputs.output_format || 'markdown' }}"
+
+          echo "🔍 Analyzing symbol: $SYMBOL across all org repos..."
+
+          "$BIN" \
+            --graph-only \
+            $WORKSPACE_ARGS \
+            --run-tool codegraph_analyze_impact \
+            --tool-args "{\"symbol\":\"${SYMBOL}\",\"depth\":3}" \
+            > impact.md 2> codegraph.err || {
+              echo "::warning::Impact analysis failed"
+              cat codegraph.err
+              echo "## ❌ Impact Analysis Failed" > impact.md
+              cat codegraph.err >> impact.md
+            }
+
+          echo "--- IMPACT RESULT ---"
+          cat impact.md
+
+      # ── 5. Also run callers + test coverage ───────────────────────────────
+      - name: Run callers & test coverage
+        run: |
+          SYMBOL="${{ github.event.inputs.symbol || 'AuthService' }}"
+
+          "$BIN" \
+            --graph-only \
+            $WORKSPACE_ARGS \
+            --run-tool codegraph_get_callers \
+            --tool-args "{\"symbol\":\"${SYMBOL}\",\"depth\":3}" \
+            > callers.md 2>> codegraph.err || true
+
+          "$BIN" \
+            --graph-only \
+            $WORKSPACE_ARGS \
+            --run-tool codegraph_find_related_tests \
+            --tool-args "{\"symbol\":\"${SYMBOL}\"}" \
+            > tests.md 2>> codegraph.err || true
+
+      # ── 6. Post comment on PR (if triggered by PR) ────────────────────────
+      - name: Post PR comment
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const symbol = '${{ github.event.inputs.symbol || 'AuthService' }}';
+            const impact  = fs.existsSync('impact.md')  ? fs.readFileSync('impact.md',  'utf8') : '_not available_';
+            const callers = fs.existsSync('callers.md') ? fs.readFileSync('callers.md', 'utf8') : '_not available_';
+            const tests   = fs.existsSync('tests.md')   ? fs.readFileSync('tests.md',   'utf8') : '_not available_';
+
+            const body = [
+              `## 🔍 CodeGraph Impact Analysis — \`${symbol}\``,
+              `> Strategy: **A — Ephemeral** (clone → index → run → delete)`,
+              ``,
+              `### 💥 Blast Radius`,
+              impact,
+              ``,
+              `### 📞 Callers (depth 3)`,
+              callers,
+              ``,
+              `### 🧪 Test Coverage`,
+              tests,
+              ``,
+              `<sub>Powered by [CodeGraph](https://github.com/codegraph-ai/codegraph) · Approach A</sub>`,
+            ].join('\n');
+
+            const marker = '## 🔍 CodeGraph Impact Analysis';
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                comment_id: existing.id, body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner, repo: context.repo.repo,
+                issue_number: context.issue.number, body,
+              });
+            }
+
+      # ── 7. Upload artifacts ────────────────────────────────────────────────
+      - name: Upload analysis artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: codegraph-impact-${{ github.run_id }}
+          path: |
+            impact.md
+            callers.md
+            tests.md
+            codegraph.err
+
+      # ── 8. Cleanup (ephemeral — no state left behind) ─────────────────────
+      - name: Cleanup cloned repos
+        if: always()
+        run: |
+          rm -rf repos/
+          echo "🧹 Repos deleted — no state persisted"
