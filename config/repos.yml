@@ -13,7 +13,8 @@ repos:
   - skills
 
 # Symbol to analyze by default when running approach A or B manually
-default_symbol: AuthService
+# Updated to target the Activity section in advisor-management (issue #1)
+default_symbol: Activity
 
 # CodeGraph settings
 codegraph:
